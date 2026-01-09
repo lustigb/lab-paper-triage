@@ -306,13 +306,13 @@ def main():
         
         # --- ICON-FIRST UI LABELS ---
         if db_voted and not user_clicked_toggle:
-            btn_label = "🗑️" # Saved State -> Icon only
+            btn_label = "🗑️" # Saved State
         elif db_voted and user_clicked_toggle:
-            btn_label = "❌ Remove" # Pending Removal -> Text Warning
+            btn_label = "❌ Remove" # Pending Removal
         elif not db_voted and user_clicked_toggle:
-            btn_label = "✅ Voted" # Pending Vote -> Confirmation Text
+            btn_label = "✅ Voted" # Pending Vote
         else:
-            btn_label = "👍" # Neutral State -> Icon only
+            btn_label = "👍" # Neutral
 
         with st.container(border=True):
             c_vote, c_btn, c_content = st.columns([0.12, 0.12, 0.76])
@@ -324,10 +324,7 @@ def main():
                 st.progress(share_pct)
 
             with c_btn:
-                if st.button(btn_label, type="secondary", key=f"btn_{doi}_{user_name}"):
-                    st.session_state[toggle_key] = not st.session_state[toggle_key]
-                    st.rerun()
-
+                # 1. VOTERS ON TOP
                 voters = str(row['voter_names']).split(',') if row['voter_names'] else []
                 if voters:
                     with st.expander(f"👥 {len(voters)}"):
@@ -336,6 +333,11 @@ def main():
                             color = MEMBER_COLORS.get(v, "#7f8c8d")
                             html_badges += f'<span class="badge" style="background-color:{color};">{v}</span>'
                         st.markdown(html_badges, unsafe_allow_html=True)
+
+                # 2. BUTTON ON BOTTOM
+                if st.button(btn_label, type="secondary", key=f"btn_{doi}_{user_name}"):
+                    st.session_state[toggle_key] = not st.session_state[toggle_key]
+                    st.rerun()
 
             with c_content:
                 with st.expander(f"**{row['title']}**"):
