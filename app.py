@@ -15,9 +15,8 @@ MEMBER_COLORS = {
     "Brian": "#e74c3c"     # Red
 }
 
-# --- GOOGLE SHEETS CONNECTION (CACHED) ---
+# --- GOOGLE SHEETS CONNECTION ---
 def get_db_connection():
-    """Establishes connection to Google Sheets using Streamlit Secrets."""
     try:
         gc = gspread.service_account_from_dict(st.secrets["gcp_service_account"])
         sh = gc.open_by_url(st.secrets["private_gsheets_url"])
@@ -27,28 +26,21 @@ def get_db_connection():
         st.stop()
 
 # --- CACHED DATA FETCHING ---
-# CRITICAL FIX: This decorator tells Streamlit "Don't run this function if you ran it 
-# less than 60 seconds ago. Just give me the result you saved."
 @st.cache_data(ttl=60)
 def load_all_data_from_sheets():
     sh = get_db_connection()
-    
-    # We fetch all 3 sheets at once to minimize connection overhead
     try:
         papers_data = sh.worksheet("papers").get_all_records()
         interest_data = sh.worksheet("interest").get_all_records()
         seen_data = sh.worksheet("seen").get_all_records()
         return papers_data, interest_data, seen_data
     except gspread.exceptions.WorksheetNotFound:
-        # If sheets don't exist yet (first run), return empty lists so init_db can handle it
         return [], [], []
     except Exception as e:
-        # If quota exceeded, wait a sec and return empty (or handle gracefully)
-        st.warning(f"High traffic (Quota Limit). Please wait 10s and refresh. Error: {e}")
+        # Graceful fallback if quota is hit
         return [], [], []
 
 def init_db():
-    """Checks if necessary worksheets exist."""
     sh = get_db_connection()
     try:
         sh.worksheet("papers")
@@ -67,18 +59,16 @@ def init_db():
         ws.append_row(["doi", "user"])
 
 def mark_as_seen(doi, user):
-    """Writes to DB and clears cache so the UI updates instantly."""
     sh = get_db_connection()
     ws = sh.worksheet("seen")
     ws.append_row([doi, user])
-    # IMPORTANT: Clear cache so the user sees the paper vanish immediately
     st.cache_data.clear()
 
 def batch_update_votes(user, selected_dois, all_displayed_dois):
     sh = get_db_connection()
     ws = sh.worksheet("interest")
     
-    # We must read fresh data here to avoid overwriting recent votes
+    # Refresh data to ensure we don't overwrite others
     data = ws.get_all_records()
     df = pd.DataFrame(data)
     
@@ -115,31 +105,30 @@ def batch_update_votes(user, selected_dois, all_displayed_dois):
         ws.append_row(["doi", "user", "timestamp"])
         if not df.empty:
             ws.append_rows(df.values.tolist())
-        
-        # IMPORTANT: Clear cache so the new votes show up immediately
         st.cache_data.clear()
             
     return changes_count
 
-# --- DATA PROCESSING (Uses Cached Data) ---
+# --- DATA PROCESSING ---
 def get_shortlist_data(current_user):
-    # Load from Cache
     papers_data, interest_data, _ = load_all_data_from_sheets()
     
     df_papers = pd.DataFrame(papers_data)
     if df_papers.empty: return pd.DataFrame()
     df_papers['doi'] = df_papers['doi'].astype(str)
+    
+    # CRITICAL FIX 1: Drop duplicate papers if they exist in DB
+    df_papers = df_papers.drop_duplicates(subset=['doi'])
 
     df_interest = pd.DataFrame(interest_data)
     if df_interest.empty:
         df_papers['total_votes'] = 0
         df_papers['voter_names'] = ""
         df_papers['my_vote'] = False
-        return pd.DataFrame() # Shortlist empty
+        return pd.DataFrame()
     
     df_interest['doi'] = df_interest['doi'].astype(str)
 
-    # Stats
     stats = df_interest.groupby('doi').agg(
         total_votes=('user', 'count'),
         voter_names=('user', lambda x: ','.join(x))
@@ -154,12 +143,14 @@ def get_shortlist_data(current_user):
     return shortlist
 
 def get_fresh_stream_by_date(current_user, start_date, end_date):
-    # Load from Cache
     papers_data, interest_data, seen_data = load_all_data_from_sheets()
     
     df_p = pd.DataFrame(papers_data)
     if df_p.empty: return pd.DataFrame()
     df_p['doi'] = df_p['doi'].astype(str)
+    
+    # CRITICAL FIX 2: Drop duplicate papers here too
+    df_p = df_p.drop_duplicates(subset=['doi'])
     
     if interest_data:
         voted_dois = set(pd.DataFrame(interest_data)['doi'].astype(str))
@@ -173,7 +164,6 @@ def get_fresh_stream_by_date(current_user, start_date, end_date):
     else:
         my_seen_dois = set()
         
-    # Date Filter
     # Robust date conversion
     df_p['date_obj'] = pd.to_datetime(df_p['date']).dt.date
     
@@ -188,13 +178,14 @@ def get_fresh_stream_by_date(current_user, start_date, end_date):
     
     return fresh_df
 
-# --- BIO-RXIV FETCHING ---
 def fetch_papers_range(start_date, end_date):
     s_date = start_date.strftime('%Y-%m-%d')
     e_date = end_date.strftime('%Y-%m-%d')
     
     sh = get_db_connection()
     ws = sh.worksheet("papers")
+    
+    # We load current data to double-check duplicates
     existing_data = ws.get_all_records()
     if existing_data:
         seen_dois = set(pd.DataFrame(existing_data)['doi'].astype(str))
@@ -218,6 +209,7 @@ def fetch_papers_range(start_date, end_date):
             
             for p in papers:
                 if p.get('category').lower() == 'neuroscience':
+                    # Extra check before adding
                     if p['doi'] not in seen_dois:
                         seen_dois.add(p['doi'])
                         link = f"https://www.biorxiv.org/content/{p['doi']}v1"
@@ -226,7 +218,6 @@ def fetch_papers_range(start_date, end_date):
                         
             cursor += len(papers)
             if len(papers) < 100: break
-            # Politeness delay to prevent BioRxiv API ban
             time.sleep(0.5) 
         except Exception: break
         
@@ -234,7 +225,6 @@ def fetch_papers_range(start_date, end_date):
     
     if new_rows:
         ws.append_rows(new_rows)
-        # Clear cache so new papers appear immediately
         st.cache_data.clear()
         return len(new_rows)
     return 0
@@ -251,7 +241,6 @@ def main():
                    border-radius: 12px; color: white; font-size: 0.75rem; font-weight: 600; text-transform: uppercase;
                }
                div[data-testid="stButton"] button { margin-top: 0px; }
-               
                div[data-testid="stVerticalBlockBorderWrapper"] {
                    border: 1px solid #e0e0e0; transition: all 0.2s ease-in-out;
                }
@@ -264,7 +253,6 @@ def main():
         </style>
         """, unsafe_allow_html=True)
 
-    # Only run init on first start to check connection
     if 'db_init' not in st.session_state:
         init_db()
         st.session_state['db_init'] = True
@@ -293,7 +281,6 @@ def main():
         st.warning("Please select your name in the sidebar.")
         return
 
-    # --- MAIN CONTENT ---
     all_visible_dois = []
     selected_dois = []
 
