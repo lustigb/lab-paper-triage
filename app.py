@@ -111,7 +111,6 @@ def get_shortlist_data(current_user):
     df_papers = pd.DataFrame(papers_data)
     if df_papers.empty: return pd.DataFrame()
     df_papers['doi'] = df_papers['doi'].astype(str)
-    # Drop duplicate papers if they exist in DB
     df_papers = df_papers.drop_duplicates(subset=['doi'])
 
     df_interest = pd.DataFrame(interest_data)
@@ -129,8 +128,23 @@ def get_shortlist_data(current_user):
     ).reset_index()
 
     shortlist = pd.merge(df_papers, stats, on='doi', how='inner')
+    
+    # --- FROZEN SORT LOGIC ---
+    # 1. Default Sort: Votes (Desc), Date (Desc)
     shortlist = shortlist.sort_values(by=['total_votes', 'date'], ascending=[False, False])
     
+    # 2. Check Session State for a "Frozen Order"
+    if 'shortlist_order' in st.session_state:
+        # Create a categorical type based on the frozen order
+        frozen_order = st.session_state['shortlist_order']
+        # Only apply this to papers that are actually in the frozen list
+        # (New papers will fall to bottom or stay sorted by logic)
+        shortlist['doi_cat'] = pd.Categorical(shortlist['doi'], categories=frozen_order, ordered=True)
+        shortlist = shortlist.sort_values('doi_cat')
+    else:
+        # If no frozen order, save current order immediately
+        st.session_state['shortlist_order'] = shortlist['doi'].tolist()
+
     my_voted_dois = df_interest[df_interest['user'] == current_user]['doi'].tolist()
     shortlist['my_vote'] = shortlist['doi'].isin(my_voted_dois)
     
@@ -142,7 +156,6 @@ def get_fresh_stream_by_date(current_user, start_date, end_date):
     df_p = pd.DataFrame(papers_data)
     if df_p.empty: return pd.DataFrame()
     df_p['doi'] = df_p['doi'].astype(str)
-    # Drop duplicate papers
     df_p = df_p.drop_duplicates(subset=['doi'])
     
     if interest_data:
@@ -226,16 +239,13 @@ def main():
         <style>
                .block-container { padding-top: 2rem; padding-bottom: 5rem; }
                
-               /* Badges: Small and colorful */
+               /* Badges inside Expander */
                .badge {
                    display: inline-block; padding: 2px 8px; margin-right: 4px; margin-top: 4px;
                    border-radius: 12px; color: white; font-size: 0.75rem; font-weight: 600; text-transform: uppercase;
                }
                
-               /* Alignment Fixes */
-               div[data-testid="stButton"] button { margin-top: 0px; }
-               
-               /* Simple Card Hover */
+               /* Card Styling */
                div[data-testid="stVerticalBlockBorderWrapper"] {
                    border: 1px solid #e0e0e0; transition: all 0.2s ease-in-out;
                }
@@ -244,6 +254,11 @@ def main():
                    background-color: #f9f9f9;
                    box-shadow: 0 4px 10px rgba(0,0,0,0.1);
                    transform: translateX(2px); 
+               }
+               
+               /* Align Toggle */
+               div[data-testid="stToggle"] {
+                    margin-top: -5px;
                }
         </style>
         """, unsafe_allow_html=True)
@@ -280,29 +295,45 @@ def main():
     selected_dois = []
 
     triaged_df = get_shortlist_data(user_name)
-    st.markdown("### 🏆 Lab Shortlist (Active)")
+    
+    # --- LAB SHORTLIST HEADER & SORTING ---
+    col_sl_title, col_sl_sort = st.columns([0.8, 0.2])
+    col_sl_title.markdown("### 🏆 Lab Shortlist (Active)")
+    
+    # The "Re-Sort" Button
+    # Clicking this clears the frozen order state, allowing the app to re-sort by votes
+    if col_sl_sort.button("🔄 Re-Sort List", help="Update the order based on latest votes"):
+        if 'shortlist_order' in st.session_state:
+            del st.session_state['shortlist_order']
+        st.rerun()
+
     if triaged_df.empty: st.info("No papers shortlisted yet.")
     
     for index, row in triaged_df.iterrows():
         all_visible_dois.append(row['doi'])
         with st.container(border=True):
-            # FIXED RATIOS: [Check | Meta | Content]
-            # Meta is narrower (0.10) to keep things tight
-            c_check, c_meta, c_content = st.columns([0.03, 0.10, 0.87])
+            # NEW LAYOUT: Toggle | Meta | Content
+            c_check, c_meta, c_content = st.columns([0.10, 0.12, 0.78])
+            
             with c_check:
-                if st.checkbox("", value=row['my_vote'], key=f"t_{row['doi']}_{user_name}"):
+                # Using Toggle instead of Checkbox for the "+1 Button" feel
+                if st.toggle(f"👍 +1", value=row['my_vote'], key=f"t_{row['doi']}_{user_name}"):
                     selected_dois.append(row['doi'])
+            
             with c_meta:
-                # CHANGED: Standard font size, bolded. Removed '###' header.
+                # Vote Count
                 st.markdown(f"**+{row['total_votes']} Votes**")
                 
-                # Badges stay small
+                # Hidden Voter List (Progressive Disclosure)
                 voters = str(row['voter_names']).split(',') if row['voter_names'] else []
-                html_badges = ""
-                for v in voters:
-                    color = MEMBER_COLORS.get(v, "#7f8c8d")
-                    html_badges += f'<span class="badge" style="background-color:{color};">{v}</span>'
-                st.markdown(html_badges, unsafe_allow_html=True)
+                if voters:
+                    with st.expander(f"👥 {len(voters)} Voters"):
+                        html_badges = ""
+                        for v in voters:
+                            color = MEMBER_COLORS.get(v, "#7f8c8d")
+                            html_badges += f'<span class="badge" style="background-color:{color};">{v}</span>'
+                        st.markdown(html_badges, unsafe_allow_html=True)
+
             with c_content:
                 with st.expander(f"**{row['title']}**"):
                     st.caption(f"{row['authors']} ({row['date']})")
@@ -311,6 +342,7 @@ def main():
 
     st.divider()
 
+    # --- FRESH STREAM ---
     fresh_df = get_fresh_stream_by_date(user_name, start_d, end_d)
     col_fresh_title, col_fresh_count = st.columns([0.8, 0.2])
     col_fresh_title.markdown(f"### 🌊 Fresh Stream ({start_d} to {end_d})")
@@ -321,15 +353,19 @@ def main():
     for index, row in fresh_df.iterrows():
         all_visible_dois.append(row['doi'])
         with st.container(border=True):
-            c_check, c_content, c_trash = st.columns([0.03, 0.92, 0.05])
+            # Layout: Toggle | Content | Trash
+            c_check, c_content, c_trash = st.columns([0.10, 0.85, 0.05])
+            
             with c_check:
-                if st.checkbox("", value=row['my_vote'], key=f"f_{row['doi']}_{user_name}"):
+                if st.toggle(f"👍 +1", value=row['my_vote'], key=f"f_{row['doi']}_{user_name}"):
                     selected_dois.append(row['doi'])
+            
             with c_content:
                 with st.expander(f"{row['title']}"):
                     st.caption(f"{row['authors']} ({row['date']})")
                     st.write(row['abstract'])
                     st.markdown(f"[Link]({row['link']})")
+            
             with c_trash:
                 if st.button("🗑️", key=f"trash_{row['doi']}_{user_name}", help="Hide this paper"):
                     mark_as_seen(row['doi'], user_name)
