@@ -225,15 +225,6 @@ def fetch_papers_range(start_date, end_date):
         return len(new_rows)
     return 0
 
-# --- HELPERS FOR BUTTON STATE ---
-# We store "PENDING CLICKS" in session state
-def toggle_vote_state(doi):
-    key = f"vote_state_{doi}"
-    if key not in st.session_state:
-        st.session_state[key] = False # Default assumption
-    # Toggle it
-    st.session_state[key] = not st.session_state[key]
-
 # --- MAIN APP UI ---
 def main():
     st.set_page_config(page_title="LabRxiv", layout="wide") 
@@ -308,51 +299,35 @@ def main():
         doi = row['doi']
         all_visible_dois.append(doi)
         
-        # --- STATE MACHINE LOGIC ---
-        # 1. Get DB State (True/False)
+        # --- STATE MACHINE ---
         db_voted = row['my_vote']
         
-        # 2. Get Toggle State (Has user clicked this session?)
+        # Toggle Session State
         toggle_key = f"vote_state_{doi}_{user_name}"
         if toggle_key not in st.session_state:
             st.session_state[toggle_key] = False
-        
         user_clicked_toggle = st.session_state[toggle_key]
         
-        # 3. Determine Final State
-        # If DB=True, Click=False -> SAVED
-        # If DB=True, Click=True -> REMOVING
-        # If DB=False, Click=False -> NONE
-        # If DB=False, Click=True -> NEW
-        
-        # Calculate "Is it effectively selected?"
-        # XOR Logic: (A and not B) or (not A and B) -> (A != B)
+        # Calculate Final Selection
         is_effectively_selected = (db_voted != user_clicked_toggle)
-        
         if is_effectively_selected:
             selected_dois.append(doi)
         
-        # 4. Button Appearance
+        # --- BUTTON LABEL LOGIC (THE QUIET UI) ---
+        # ALL BUTTONS ARE 'secondary' (Neutral/Grey)
+        
         if db_voted and not user_clicked_toggle:
-            # Stable Saved -> Pressed (Primary)
-            btn_label = "✅ Voted"
-            btn_type = "primary"
-            help_txt = "You voted for this. Click to remove."
+            # SAVED STATE
+            btn_label = "🗑️ Remove"
         elif db_voted and user_clicked_toggle:
-            # Removing -> Unpressed (Secondary)
-            btn_label = "❌ Remove?"
-            btn_type = "secondary"
-            help_txt = "Pending removal. Submit to save."
+            # REMOVING STATE (Pending)
+            btn_label = "❌ Unvoted"
         elif not db_voted and user_clicked_toggle:
-            # New -> Pressed (Primary)
-            btn_label = "✨ Added"
-            btn_type = "primary"
-            help_txt = "New vote! Submit to save."
+            # NEW VOTE STATE (Pending)
+            btn_label = "✅ Voted"
         else:
-            # None -> Unpressed (Secondary)
+            # EMPTY STATE
             btn_label = "👍 Vote"
-            btn_type = "secondary"
-            help_txt = "Click to vote."
 
         with st.container(border=True):
             c_vote, c_btn, c_content = st.columns([0.12, 0.12, 0.76])
@@ -364,9 +339,8 @@ def main():
                 st.progress(share_pct)
 
             with c_btn:
-                # The Action Button
-                if st.button(btn_label, type=btn_type, key=f"btn_{doi}_{user_name}", help=help_txt):
-                    # Toggle the session state clicker
+                # Always Type="secondary" for neutral look
+                if st.button(btn_label, type="secondary", key=f"btn_{doi}_{user_name}"):
                     st.session_state[toggle_key] = not st.session_state[toggle_key]
                     st.rerun()
 
@@ -398,29 +372,23 @@ def main():
         doi = row['doi']
         all_visible_dois.append(doi)
         
-        # --- FRESH STREAM BUTTON LOGIC ---
-        # Note: Fresh papers are NEVER in DB for current user (by definition of fetch query),
-        # so we only have 2 states: None or New.
-        
         toggle_key = f"vote_state_{doi}_{user_name}"
         if toggle_key not in st.session_state:
             st.session_state[toggle_key] = False
-        
         user_clicked_toggle = st.session_state[toggle_key]
         
         if user_clicked_toggle:
             selected_dois.append(doi)
-            btn_label = "✨ Added"
-            btn_type = "primary"
+            btn_label = "✅ Voted"
         else:
             btn_label = "👍 Vote"
-            btn_type = "secondary"
 
         with st.container(border=True):
             c_btn, c_content, c_trash = st.columns([0.12, 0.83, 0.05])
             
             with c_btn:
-                if st.button(btn_label, type=btn_type, key=f"f_btn_{doi}_{user_name}"):
+                # Always Type="secondary"
+                if st.button(btn_label, type="secondary", key=f"f_btn_{doi}_{user_name}"):
                     st.session_state[toggle_key] = not st.session_state[toggle_key]
                     st.rerun()
             
@@ -439,9 +407,6 @@ def main():
     if st.sidebar.button("💾 Submit Votes", type="primary"):
         changes = batch_update_votes(user_name, set(selected_dois), all_visible_dois)
         
-        # RESET ALL LOCAL TOGGLES
-        # We need to find all session state keys for this user and clear them
-        # so the buttons revert to their "Stable DB" state
         keys_to_reset = [k for k in st.session_state.keys() if f"vote_state_" in k and user_name in k]
         for k in keys_to_reset:
             st.session_state[k] = False
