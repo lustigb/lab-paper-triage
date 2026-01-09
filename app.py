@@ -225,6 +225,15 @@ def fetch_papers_range(start_date, end_date):
         return len(new_rows)
     return 0
 
+# --- HELPERS FOR BUTTON STATE ---
+# We store "PENDING CLICKS" in session state
+def toggle_vote_state(doi):
+    key = f"vote_state_{doi}"
+    if key not in st.session_state:
+        st.session_state[key] = False # Default assumption
+    # Toggle it
+    st.session_state[key] = not st.session_state[key]
+
 # --- MAIN APP UI ---
 def main():
     st.set_page_config(page_title="LabRxiv", layout="wide") 
@@ -232,14 +241,10 @@ def main():
     st.markdown("""
         <style>
                .block-container { padding-top: 2rem; padding-bottom: 5rem; }
-               
-               /* Badges */
                .badge {
                    display: inline-block; padding: 2px 8px; margin-right: 4px; margin-top: 4px;
                    border-radius: 12px; color: white; font-size: 0.75rem; font-weight: 600; text-transform: uppercase;
                }
-
-               /* Card Styling */
                div[data-testid="stVerticalBlockBorderWrapper"] {
                    border: 1px solid #e0e0e0; transition: all 0.2s ease-in-out;
                }
@@ -249,10 +254,11 @@ def main():
                    box-shadow: 0 4px 10px rgba(0,0,0,0.1);
                    transform: translateX(2px); 
                }
-               
-               /* Vote Count Styling */
                .big-vote { font-size: 1.5rem; font-weight: 800; color: #333; line-height: 1.2; }
                .vote-share { font-size: 0.75rem; color: #666; }
+               
+               /* Center the button */
+               div[data-testid="stButton"] { text-align: center; }
         </style>
         """, unsafe_allow_html=True)
 
@@ -299,10 +305,57 @@ def main():
     if triaged_df.empty: st.info("No papers shortlisted yet.")
     
     for index, row in triaged_df.iterrows():
-        all_visible_dois.append(row['doi'])
+        doi = row['doi']
+        all_visible_dois.append(doi)
+        
+        # --- STATE MACHINE LOGIC ---
+        # 1. Get DB State (True/False)
+        db_voted = row['my_vote']
+        
+        # 2. Get Toggle State (Has user clicked this session?)
+        toggle_key = f"vote_state_{doi}_{user_name}"
+        if toggle_key not in st.session_state:
+            st.session_state[toggle_key] = False
+        
+        user_clicked_toggle = st.session_state[toggle_key]
+        
+        # 3. Determine Final State
+        # If DB=True, Click=False -> SAVED
+        # If DB=True, Click=True -> REMOVING
+        # If DB=False, Click=False -> NONE
+        # If DB=False, Click=True -> NEW
+        
+        # Calculate "Is it effectively selected?"
+        # XOR Logic: (A and not B) or (not A and B) -> (A != B)
+        is_effectively_selected = (db_voted != user_clicked_toggle)
+        
+        if is_effectively_selected:
+            selected_dois.append(doi)
+        
+        # 4. Button Appearance
+        if db_voted and not user_clicked_toggle:
+            # Stable Saved -> Pressed (Primary)
+            btn_label = "✅ Voted"
+            btn_type = "primary"
+            help_txt = "You voted for this. Click to remove."
+        elif db_voted and user_clicked_toggle:
+            # Removing -> Unpressed (Secondary)
+            btn_label = "❌ Remove?"
+            btn_type = "secondary"
+            help_txt = "Pending removal. Submit to save."
+        elif not db_voted and user_clicked_toggle:
+            # New -> Pressed (Primary)
+            btn_label = "✨ Added"
+            btn_type = "primary"
+            help_txt = "New vote! Submit to save."
+        else:
+            # None -> Unpressed (Secondary)
+            btn_label = "👍 Vote"
+            btn_type = "secondary"
+            help_txt = "Click to vote."
+
         with st.container(border=True):
-            # Layout: [VoteCount(0.12) | Toggle(0.12) | Content(0.76)]
-            c_vote, c_toggle, c_content = st.columns([0.12, 0.12, 0.76])
+            c_vote, c_btn, c_content = st.columns([0.12, 0.12, 0.76])
             
             with c_vote:
                 st.markdown(f'<div class="big-vote">{row["total_votes"]}</div>', unsafe_allow_html=True)
@@ -310,51 +363,12 @@ def main():
                 st.markdown(f'<div class="vote-share">{share_pct:.0%} share</div>', unsafe_allow_html=True)
                 st.progress(share_pct)
 
-            with c_toggle:
-                # DYNAMIC LABEL LOGIC
-                # Determine the label based on State + Interaction
-                # Note: We need a temporary key to detect the interaction before we render? 
-                # Streamlit updates on interaction. 
-                
-                # Default Label
-                label = "👍 +1"
-                
-                # Check previous state from DB
-                was_voted = row['my_vote']
-                
-                # The widget will return True/False based on user click
-                # But we need to set the label *before* the click in the UI? 
-                # Actually, Streamlit reruns the script on click.
-                
-                # Logic:
-                # If DB=True, Widget=True -> Saved (Blue)
-                # If DB=True, Widget=False -> Removing (Red)
-                # If DB=False, Widget=True -> New (Green)
-                # If DB=False, Widget=False -> Default
-                
-                # We can't know the widget state *before* we render it for the first time in the loop.
-                # However, we can use session state to track *pending* changes if we wanted complex label updates.
-                # For simplicity, let's use the DB state to set the initial label style.
-                
-                # We will just use the DB state to determine the 'Resting' label.
-                # If the user toggles it, the label won't update instantly to 'New' unless we use session state callbacks.
-                # BUT, visual feedback via the toggle switch position is usually enough.
-                # Let's try to be clever:
-                
-                toggle_val = st.toggle(label, value=row['my_vote'], key=f"t_{row['doi']}_{user_name}")
-                
-                if toggle_val:
-                    selected_dois.append(row['doi'])
-                
-                # Implicit Status Indicators (Using Icons below toggle to keep it clean)
-                if was_voted and toggle_val:
-                    st.caption("🔵 Saved")
-                elif was_voted and not toggle_val:
-                    st.caption("🔴 Removing")
-                elif not was_voted and toggle_val:
-                    st.caption("🟢 New")
-                else:
-                    st.caption("") # Spacer
+            with c_btn:
+                # The Action Button
+                if st.button(btn_label, type=btn_type, key=f"btn_{doi}_{user_name}", help=help_txt):
+                    # Toggle the session state clicker
+                    st.session_state[toggle_key] = not st.session_state[toggle_key]
+                    st.rerun()
 
                 voters = str(row['voter_names']).split(',') if row['voter_names'] else []
                 if voters:
@@ -381,17 +395,34 @@ def main():
     if fresh_df.empty: st.info(f"No papers found for this range.")
     
     for index, row in fresh_df.iterrows():
-        all_visible_dois.append(row['doi'])
+        doi = row['doi']
+        all_visible_dois.append(doi)
+        
+        # --- FRESH STREAM BUTTON LOGIC ---
+        # Note: Fresh papers are NEVER in DB for current user (by definition of fetch query),
+        # so we only have 2 states: None or New.
+        
+        toggle_key = f"vote_state_{doi}_{user_name}"
+        if toggle_key not in st.session_state:
+            st.session_state[toggle_key] = False
+        
+        user_clicked_toggle = st.session_state[toggle_key]
+        
+        if user_clicked_toggle:
+            selected_dois.append(doi)
+            btn_label = "✨ Added"
+            btn_type = "primary"
+        else:
+            btn_label = "👍 Vote"
+            btn_type = "secondary"
+
         with st.container(border=True):
-            c_check, c_content, c_trash = st.columns([0.12, 0.83, 0.05])
+            c_btn, c_content, c_trash = st.columns([0.12, 0.83, 0.05])
             
-            with c_check:
-                toggle_val = st.toggle("👍 +1", value=row['my_vote'], key=f"f_{row['doi']}_{user_name}")
-                if toggle_val:
-                    selected_dois.append(row['doi'])
-                    st.caption("🟢 New")
-                else:
-                    st.caption("")
+            with c_btn:
+                if st.button(btn_label, type=btn_type, key=f"f_btn_{doi}_{user_name}"):
+                    st.session_state[toggle_key] = not st.session_state[toggle_key]
+                    st.rerun()
             
             with c_content:
                 with st.expander(f"{row['title']}"):
@@ -407,6 +438,14 @@ def main():
     st.sidebar.divider()
     if st.sidebar.button("💾 Submit Votes", type="primary"):
         changes = batch_update_votes(user_name, set(selected_dois), all_visible_dois)
+        
+        # RESET ALL LOCAL TOGGLES
+        # We need to find all session state keys for this user and clear them
+        # so the buttons revert to their "Stable DB" state
+        keys_to_reset = [k for k in st.session_state.keys() if f"vote_state_" in k and user_name in k]
+        for k in keys_to_reset:
+            st.session_state[k] = False
+            
         if changes > 0:
             st.toast(f"Updated {changes} votes!")
             if 'shortlist_order' in st.session_state:
