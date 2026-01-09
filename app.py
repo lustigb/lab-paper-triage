@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import gspread
 from datetime import datetime, timedelta
+import time
 
 # --- CONFIGURATION ---
 LAB_MEMBERS = ["Select User...", "Albert", "Shinsuke", "Jaeson", "Brian"]
@@ -14,91 +15,84 @@ MEMBER_COLORS = {
     "Brian": "#e74c3c"     # Red
 }
 
-# --- GOOGLE SHEETS CONNECTION ---
+# --- GOOGLE SHEETS CONNECTION (CACHED) ---
 def get_db_connection():
     """Establishes connection to Google Sheets using Streamlit Secrets."""
     try:
-        # Create a gspread client using the secrets
         gc = gspread.service_account_from_dict(st.secrets["gcp_service_account"])
-        # Open the sheet by URL
         sh = gc.open_by_url(st.secrets["private_gsheets_url"])
         return sh
     except Exception as e:
         st.error(f"Failed to connect to Google Sheets: {e}")
         st.stop()
 
-def init_db():
-    """Checks if necessary worksheets exist, creates headers if missing."""
+# --- CACHED DATA FETCHING ---
+# CRITICAL FIX: This decorator tells Streamlit "Don't run this function if you ran it 
+# less than 60 seconds ago. Just give me the result you saved."
+@st.cache_data(ttl=60)
+def load_all_data_from_sheets():
     sh = get_db_connection()
     
-    # 1. PAPERS SHEET
+    # We fetch all 3 sheets at once to minimize connection overhead
     try:
-        ws_papers = sh.worksheet("papers")
-    except:
-        ws_papers = sh.add_worksheet(title="papers", rows=1000, cols=7)
-        ws_papers.append_row(["doi", "title", "authors", "abstract", "link", "category", "date"])
+        papers_data = sh.worksheet("papers").get_all_records()
+        interest_data = sh.worksheet("interest").get_all_records()
+        seen_data = sh.worksheet("seen").get_all_records()
+        return papers_data, interest_data, seen_data
+    except gspread.exceptions.WorksheetNotFound:
+        # If sheets don't exist yet (first run), return empty lists so init_db can handle it
+        return [], [], []
+    except Exception as e:
+        # If quota exceeded, wait a sec and return empty (or handle gracefully)
+        st.warning(f"High traffic (Quota Limit). Please wait 10s and refresh. Error: {e}")
+        return [], [], []
 
-    # 2. INTEREST SHEET (Votes)
+def init_db():
+    """Checks if necessary worksheets exist."""
+    sh = get_db_connection()
     try:
-        ws_interest = sh.worksheet("interest")
+        sh.worksheet("papers")
     except:
-        ws_interest = sh.add_worksheet(title="interest", rows=1000, cols=3)
-        ws_interest.append_row(["doi", "user", "timestamp"])
-
-    # 3. SEEN SHEET (Trash)
+        ws = sh.add_worksheet(title="papers", rows=1000, cols=7)
+        ws.append_row(["doi", "title", "authors", "abstract", "link", "category", "date"])
     try:
-        ws_seen = sh.worksheet("seen")
+        sh.worksheet("interest")
     except:
-        ws_seen = sh.add_worksheet(title="seen", rows=1000, cols=2)
-        ws_seen.append_row(["doi", "user"])
+        ws = sh.add_worksheet(title="interest", rows=1000, cols=3)
+        ws.append_row(["doi", "user", "timestamp"])
+    try:
+        sh.worksheet("seen")
+    except:
+        ws = sh.add_worksheet(title="seen", rows=1000, cols=2)
+        ws.append_row(["doi", "user"])
 
 def mark_as_seen(doi, user):
-    """Appends a row to the 'seen' worksheet."""
+    """Writes to DB and clears cache so the UI updates instantly."""
     sh = get_db_connection()
     ws = sh.worksheet("seen")
-    # Check if already exists to avoid duplicates (Client-side check expensive, just append unique?)
-    # For speed in GSheets, we often just append. We can dedup in Pandas on read.
-    # But let's do a quick check to keep sheet clean.
-    
-    # Actually, simpler: Just Append. We filter duplicates on Read.
     ws.append_row([doi, user])
+    # IMPORTANT: Clear cache so the user sees the paper vanish immediately
+    st.cache_data.clear()
 
 def batch_update_votes(user, selected_dois, all_displayed_dois):
-    """
-    Syncs votes to Google Sheets.
-    Strategy: Read current votes, calculate delta, update sheet.
-    This is 'Nuclear' but safe: Read All -> Logic -> Write Back is dangerous with concurrency.
-    Better: Append new votes. To remove votes, we must find and delete.
-    """
     sh = get_db_connection()
     ws = sh.worksheet("interest")
     
-    # 1. Fetch current interest data
+    # We must read fresh data here to avoid overwriting recent votes
     data = ws.get_all_records()
     df = pd.DataFrame(data)
     
-    # Ensure columns exist (handle empty sheet case)
     if df.empty:
         df = pd.DataFrame(columns=["doi", "user", "timestamp"])
     else:
-        # Convert all to string to ensure matching
         df['doi'] = df['doi'].astype(str)
         df['user'] = df['user'].astype(str)
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     changes_count = 0
     
-    # We need to rebuild the interest list for THIS user based on displayed DOIs
-    
-    # List of DOIs this user currently has in the DB
     current_user_votes = df[df['user'] == user]['doi'].tolist()
-    
     rows_to_add = []
-    # We can't easily batch delete scattered rows in GSheets.
-    # Strategy: We will identify rows to DELETE and rows to ADD.
-    # To delete, we will clear the sheet and rewrite the updated DF. 
-    # (Note: This is risky if 2 people vote EXACTLY at the same time, but acceptable for a small lab).
-    
     modified = False
     
     for doi in all_displayed_dois:
@@ -106,96 +100,72 @@ def batch_update_votes(user, selected_dois, all_displayed_dois):
         already_voted = doi in current_user_votes
         
         if is_checked and not already_voted:
-            # Add new vote
-            new_row = {"doi": doi, "user": user, "timestamp": timestamp}
-            rows_to_add.append(new_row)
+            rows_to_add.append({"doi": doi, "user": user, "timestamp": timestamp})
             modified = True
             changes_count += 1
-            
         elif not is_checked and already_voted:
-            # Remove vote
-            # Filter the DF to exclude this specific row
             df = df[~((df['doi'] == doi) & (df['user'] == user))]
             modified = True
             changes_count += 1
 
     if modified:
-        # If we added rows, concat them to DF
         if rows_to_add:
-            df_add = pd.DataFrame(rows_to_add)
-            df = pd.concat([df, df_add], ignore_index=True)
-        
-        # WRITE BACK STRATEGY
-        # 1. Clear Sheet
+            df = pd.concat([df, pd.DataFrame(rows_to_add)], ignore_index=True)
         ws.clear()
-        # 2. Add Header
         ws.append_row(["doi", "user", "timestamp"])
-        # 3. Add Data
-        # gspread expects a list of lists
         if not df.empty:
             ws.append_rows(df.values.tolist())
+        
+        # IMPORTANT: Clear cache so the new votes show up immediately
+        st.cache_data.clear()
             
     return changes_count
 
+# --- DATA PROCESSING (Uses Cached Data) ---
 def get_shortlist_data(current_user):
-    sh = get_db_connection()
+    # Load from Cache
+    papers_data, interest_data, _ = load_all_data_from_sheets()
     
-    # Fetch Papers
-    papers_data = sh.worksheet("papers").get_all_records()
     df_papers = pd.DataFrame(papers_data)
     if df_papers.empty: return pd.DataFrame()
     df_papers['doi'] = df_papers['doi'].astype(str)
 
-    # Fetch Interests
-    interest_data = sh.worksheet("interest").get_all_records()
     df_interest = pd.DataFrame(interest_data)
-    
     if df_interest.empty:
         df_papers['total_votes'] = 0
         df_papers['voter_names'] = ""
         df_papers['my_vote'] = False
-        return pd.DataFrame() # Return empty if no votes at all? No, technically shortlist is empty.
+        return pd.DataFrame() # Shortlist empty
     
     df_interest['doi'] = df_interest['doi'].astype(str)
 
-    # Aggregate Votes
-    # Group by DOI, count votes, and join user names
+    # Stats
     stats = df_interest.groupby('doi').agg(
         total_votes=('user', 'count'),
         voter_names=('user', lambda x: ','.join(x))
     ).reset_index()
 
-    # Merge with Papers
-    # Inner join because shortlist only shows voted papers
     shortlist = pd.merge(df_papers, stats, on='doi', how='inner')
-    
-    # Sort
     shortlist = shortlist.sort_values(by=['total_votes', 'date'], ascending=[False, False])
     
-    # Determine 'my_vote'
     my_voted_dois = df_interest[df_interest['user'] == current_user]['doi'].tolist()
     shortlist['my_vote'] = shortlist['doi'].isin(my_voted_dois)
     
     return shortlist
 
 def get_fresh_stream_by_date(current_user, start_date, end_date):
-    sh = get_db_connection()
+    # Load from Cache
+    papers_data, interest_data, seen_data = load_all_data_from_sheets()
     
-    # 1. Fetch Papers
-    papers_data = sh.worksheet("papers").get_all_records()
     df_p = pd.DataFrame(papers_data)
     if df_p.empty: return pd.DataFrame()
     df_p['doi'] = df_p['doi'].astype(str)
     
-    # 2. Fetch Interests (to exclude voted)
-    interest_data = sh.worksheet("interest").get_all_records()
     if interest_data:
         voted_dois = set(pd.DataFrame(interest_data)['doi'].astype(str))
     else:
         voted_dois = set()
         
-    # 3. Fetch Seen (to exclude trashed)
-    seen_data = sh.worksheet("seen").get_all_records()
     if seen_data:
         df_seen = pd.DataFrame(seen_data)
         df_seen['doi'] = df_seen['doi'].astype(str)
@@ -203,19 +173,17 @@ def get_fresh_stream_by_date(current_user, start_date, end_date):
     else:
         my_seen_dois = set()
         
-    # 4. Filter
-    # Filter by Date
-    df_p['date'] = pd.to_datetime(df_p['date']).dt.date
-    # Convert inputs to date objects if they are strings (streamlit date_input returns date objects usually)
+    # Date Filter
+    # Robust date conversion
+    df_p['date_obj'] = pd.to_datetime(df_p['date']).dt.date
     
-    mask_date = (df_p['date'] >= start_date) & (df_p['date'] <= end_date)
+    mask_date = (df_p['date_obj'] >= start_date) & (df_p['date_obj'] <= end_date)
     mask_not_voted = ~df_p['doi'].isin(voted_dois)
     mask_not_seen = ~df_p['doi'].isin(my_seen_dois)
     
     fresh_df = df_p[mask_date & mask_not_voted & mask_not_seen].copy()
-    
     fresh_df = fresh_df.sort_values(by='date', ascending=False)
-    fresh_df['my_vote'] = False # Fresh papers are by definition not voted by anyone
+    fresh_df['my_vote'] = False 
     fresh_df['total_votes'] = 0
     
     return fresh_df
@@ -225,7 +193,6 @@ def fetch_papers_range(start_date, end_date):
     s_date = start_date.strftime('%Y-%m-%d')
     e_date = end_date.strftime('%Y-%m-%d')
     
-    # Get existing DOIs from Sheet to avoid duplicates
     sh = get_db_connection()
     ws = sh.worksheet("papers")
     existing_data = ws.get_all_records()
@@ -254,28 +221,21 @@ def fetch_papers_range(start_date, end_date):
                     if p['doi'] not in seen_dois:
                         seen_dois.add(p['doi'])
                         link = f"https://www.biorxiv.org/content/{p['doi']}v1"
-                        
-                        # Prepare Row
-                        row = [
-                            p['doi'], 
-                            p['title'], 
-                            p['authors'], 
-                            p['abstract'], 
-                            link, 
-                            p['category'], 
-                            p['date']
-                        ]
+                        row = [p['doi'], p['title'], p['authors'], p['abstract'], link, p['category'], p['date']]
                         new_rows.append(row)
                         
             cursor += len(papers)
             if len(papers) < 100: break
+            # Politeness delay to prevent BioRxiv API ban
+            time.sleep(0.5) 
         except Exception: break
         
     my_bar.empty()
     
-    # Bulk Append to Sheet
     if new_rows:
         ws.append_rows(new_rows)
+        # Clear cache so new papers appear immediately
+        st.cache_data.clear()
         return len(new_rows)
     return 0
 
@@ -292,7 +252,6 @@ def main():
                }
                div[data-testid="stButton"] button { margin-top: 0px; }
                
-               /* --- SIMPLE HOVER --- */
                div[data-testid="stVerticalBlockBorderWrapper"] {
                    border: 1px solid #e0e0e0; transition: all 0.2s ease-in-out;
                }
@@ -305,10 +264,11 @@ def main():
         </style>
         """, unsafe_allow_html=True)
 
-    # Initialize Sheet Tabs
-    init_db()
+    # Only run init on first start to check connection
+    if 'db_init' not in st.session_state:
+        init_db()
+        st.session_state['db_init'] = True
     
-    # --- SIDEBAR ---
     st.sidebar.title("🧠 LabRxiv")
     user_name = st.sidebar.selectbox("Current User:", LAB_MEMBERS)
     st.sidebar.divider()
@@ -337,7 +297,6 @@ def main():
     all_visible_dois = []
     selected_dois = []
 
-    # 1. SHORTLIST
     triaged_df = get_shortlist_data(user_name)
     st.markdown("### 🏆 Lab Shortlist (Active)")
     if triaged_df.empty: st.info("No papers shortlisted yet.")
@@ -365,9 +324,7 @@ def main():
 
     st.divider()
 
-    # 2. FRESH STREAM
     fresh_df = get_fresh_stream_by_date(user_name, start_d, end_d)
-    
     col_fresh_title, col_fresh_count = st.columns([0.8, 0.2])
     col_fresh_title.markdown(f"### 🌊 Fresh Stream ({start_d} to {end_d})")
     if not fresh_df.empty: col_fresh_count.caption(f"Showing {len(fresh_df)} papers")
@@ -391,7 +348,6 @@ def main():
                     mark_as_seen(row['doi'], user_name)
                     st.rerun()
 
-    # --- SUBMIT ---
     st.sidebar.divider()
     st.sidebar.markdown("**Done reviewing?**")
     if st.sidebar.button("💾 Submit / Update Votes", type="primary"):
