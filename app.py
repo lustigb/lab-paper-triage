@@ -55,17 +55,14 @@ def init_db():
         ws = sh.add_worksheet(title="seen", rows=1000, cols=2)
         ws.append_row(["doi", "user"])
 
-def mark_as_seen(doi, user):
+# --- BATCH UPDATE (VOTES AND TRASH) ---
+def batch_update_all(user, selected_dois, trashed_dois, all_displayed_dois):
     sh = get_db_connection()
-    ws = sh.worksheet("seen")
-    ws.append_row([doi, user])
-    st.cache_data.clear()
-
-def batch_update_votes(user, selected_dois, all_displayed_dois):
-    sh = get_db_connection()
-    ws = sh.worksheet("interest")
+    ws_interest = sh.worksheet("interest")
+    ws_seen = sh.worksheet("seen")
     
-    data = ws.get_all_records()
+    # 1. HANDLE VOTES (Interest Sheet)
+    data = ws_interest.get_all_records()
     df = pd.DataFrame(data)
     
     if df.empty:
@@ -97,10 +94,19 @@ def batch_update_votes(user, selected_dois, all_displayed_dois):
     if modified:
         if rows_to_add:
             df = pd.concat([df, pd.DataFrame(rows_to_add)], ignore_index=True)
-        ws.clear()
-        ws.append_row(["doi", "user", "timestamp"])
+        ws_interest.clear()
+        ws_interest.append_row(["doi", "user", "timestamp"])
         if not df.empty:
-            ws.append_rows(df.values.tolist())
+            ws_interest.append_rows(df.values.tolist())
+            
+    # 2. HANDLE TRASH (Seen Sheet)
+    # We only ADD to seen, we rarely remove (unless manual DB edit)
+    if trashed_dois:
+        trash_rows = [[doi, user] for doi in trashed_dois]
+        ws_seen.append_rows(trash_rows)
+        changes_count += len(trash_rows)
+
+    if changes_count > 0:
         st.cache_data.clear()
             
     return changes_count
@@ -131,6 +137,7 @@ def get_shortlist_data(current_user):
     shortlist = pd.merge(df_papers, stats, on='doi', how='inner')
     shortlist = shortlist.sort_values(by=['total_votes', 'date'], ascending=[False, False])
     
+    # Frozen Order
     if 'shortlist_order' in st.session_state:
         frozen_order = st.session_state['shortlist_order']
         shortlist['doi_cat'] = pd.Categorical(shortlist['doi'], categories=frozen_order, ordered=True)
@@ -244,9 +251,7 @@ def main():
                    box-shadow: 0 4px 10px rgba(0,0,0,0.1);
                    transform: translateX(2px); 
                }
-               /* New Style for Vote Share */
                .share-text { font-size: 1.1rem; font-weight: 800; color: #444; line-height: 1.2; margin-bottom: 4px; }
-               
                div[data-testid="stButton"] { text-align: center; }
         </style>
         """, unsafe_allow_html=True)
@@ -280,7 +285,9 @@ def main():
 
     all_visible_dois = []
     selected_dois = []
+    trashed_dois = []
 
+    # --- 1. LAB SHORTLIST ---
     triaged_df = get_shortlist_data(user_name)
     total_system_votes = triaged_df['total_votes'].sum() if not triaged_df.empty else 1
 
@@ -291,39 +298,31 @@ def main():
         doi = row['doi']
         all_visible_dois.append(doi)
         
-        # --- STATE MACHINE ---
+        # Vote Toggle Logic
         db_voted = row['my_vote']
-        
         toggle_key = f"vote_state_{doi}_{user_name}"
-        if toggle_key not in st.session_state:
-            st.session_state[toggle_key] = False
+        if toggle_key not in st.session_state: st.session_state[toggle_key] = False
         user_clicked_toggle = st.session_state[toggle_key]
         
         is_effectively_selected = (db_voted != user_clicked_toggle)
-        if is_effectively_selected:
-            selected_dois.append(doi)
+        if is_effectively_selected: selected_dois.append(doi)
         
-        # --- ICON-FIRST UI LABELS ---
-        if db_voted and not user_clicked_toggle:
-            btn_label = "🗑️" # Saved
-        elif db_voted and user_clicked_toggle:
-            btn_label = "❌ Remove" # Pending Removal
-        elif not db_voted and user_clicked_toggle:
-            btn_label = "✅ Voted" # Pending Vote
-        else:
-            btn_label = "👍" # Neutral
+        # Labels
+        if db_voted and not user_clicked_toggle: btn_label = "🗑️"
+        elif db_voted and user_clicked_toggle: btn_label = "❌ Remove"
+        elif not db_voted and user_clicked_toggle: btn_label = "✅ Voted"
+        else: btn_label = "👍"
 
         with st.container(border=True):
             c_vote, c_btn, c_content = st.columns([0.12, 0.12, 0.76])
             
             with c_vote:
-                # REPLACED BIG NUMBER WITH SHARE TEXT
                 share_pct = row['total_votes'] / total_system_votes
                 st.markdown(f'<div class="share-text">{share_pct:.0%} Share</div>', unsafe_allow_html=True)
                 st.progress(share_pct)
 
             with c_btn:
-                # 1. VOTERS ON TOP
+                # Voters on Top
                 voters = str(row['voter_names']).split(',') if row['voter_names'] else []
                 if voters:
                     with st.expander(f"👥 {len(voters)}"):
@@ -332,8 +331,8 @@ def main():
                             color = MEMBER_COLORS.get(v, "#7f8c8d")
                             html_badges += f'<span class="badge" style="background-color:{color};">{v}</span>'
                         st.markdown(html_badges, unsafe_allow_html=True)
-
-                # 2. BUTTON ON BOTTOM
+                
+                # Button on Bottom
                 if st.button(btn_label, type="secondary", key=f"btn_{doi}_{user_name}"):
                     st.session_state[toggle_key] = not st.session_state[toggle_key]
                     st.rerun()
@@ -346,6 +345,7 @@ def main():
 
     st.divider()
 
+    # --- 2. FRESH STREAM ---
     fresh_df = get_fresh_stream_by_date(user_name, start_d, end_d)
     c_fresh_h, c_fresh_cnt = st.columns([0.8, 0.2])
     c_fresh_h.markdown(f"### 🌊 Fresh Stream ({start_d} to {end_d})")
@@ -357,46 +357,60 @@ def main():
         doi = row['doi']
         all_visible_dois.append(doi)
         
-        toggle_key = f"vote_state_{doi}_{user_name}"
-        if toggle_key not in st.session_state:
-            st.session_state[toggle_key] = False
-        user_clicked_toggle = st.session_state[toggle_key]
+        # A. VOTE LOGIC
+        vote_key = f"vote_state_{doi}_{user_name}"
+        if vote_key not in st.session_state: st.session_state[vote_key] = False
+        user_clicked_vote = st.session_state[vote_key]
         
-        if user_clicked_toggle:
+        if user_clicked_vote:
             selected_dois.append(doi)
-            btn_label = "✅ Voted"
+            vote_label = "✅ Voted"
         else:
-            btn_label = "👍"
+            vote_label = "👍"
+
+        # B. TRASH LOGIC
+        trash_key = f"trash_state_{doi}_{user_name}"
+        if trash_key not in st.session_state: st.session_state[trash_key] = False
+        user_clicked_trash = st.session_state[trash_key]
+
+        if user_clicked_trash:
+            trashed_dois.append(doi)
+            trash_label = "❌ Remove"
+        else:
+            trash_label = "🗑️"
 
         with st.container(border=True):
-            c_btn, c_content, c_trash = st.columns([0.12, 0.83, 0.05])
+            # NEW LAYOUT: [VoteBtn] [TrashBtn] [Content]
+            c_vote_btn, c_trash_btn, c_content = st.columns([0.10, 0.10, 0.80])
             
-            with c_btn:
-                if st.button(btn_label, type="secondary", key=f"f_btn_{doi}_{user_name}"):
-                    st.session_state[toggle_key] = not st.session_state[toggle_key]
+            with c_vote_btn:
+                if st.button(vote_label, type="secondary", key=f"f_v_btn_{doi}_{user_name}"):
+                    st.session_state[vote_key] = not st.session_state[vote_key]
                     st.rerun()
             
+            with c_trash_btn:
+                if st.button(trash_label, type="secondary", key=f"f_t_btn_{doi}_{user_name}"):
+                    st.session_state[trash_key] = not st.session_state[trash_key]
+                    st.rerun()
+
             with c_content:
                 with st.expander(f"{row['title']}"):
                     st.caption(f"{row['authors']} ({row['date']})")
                     st.write(row['abstract'])
                     st.markdown(f"[Link]({row['link']})")
-            
-            with c_trash:
-                if st.button("🗑️", key=f"trash_{row['doi']}_{user_name}", help="Hide this paper"):
-                    mark_as_seen(row['doi'], user_name)
-                    st.rerun()
 
     st.sidebar.divider()
     if st.sidebar.button("💾 Submit Votes", type="primary"):
-        changes = batch_update_votes(user_name, set(selected_dois), all_visible_dois)
+        # Update both Votes AND Trash
+        changes = batch_update_all(user_name, set(selected_dois), set(trashed_dois), all_visible_dois)
         
-        keys_to_reset = [k for k in st.session_state.keys() if f"vote_state_" in k and user_name in k]
+        # Reset Local States
+        keys_to_reset = [k for k in st.session_state.keys() if (f"vote_state_" in k or f"trash_state_" in k) and user_name in k]
         for k in keys_to_reset:
             st.session_state[k] = False
             
         if changes > 0:
-            st.toast(f"Updated {changes} votes!")
+            st.toast(f"Processed {changes} updates!")
             if 'shortlist_order' in st.session_state:
                 del st.session_state['shortlist_order']
             st.rerun()
