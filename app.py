@@ -37,23 +37,19 @@ def load_all_data_from_sheets():
     except gspread.exceptions.WorksheetNotFound:
         return [], [], []
     except Exception as e:
-        # Graceful fallback if quota is hit
         return [], [], []
 
 def init_db():
     sh = get_db_connection()
-    try:
-        sh.worksheet("papers")
+    try: sh.worksheet("papers")
     except:
         ws = sh.add_worksheet(title="papers", rows=1000, cols=7)
         ws.append_row(["doi", "title", "authors", "abstract", "link", "category", "date"])
-    try:
-        sh.worksheet("interest")
+    try: sh.worksheet("interest")
     except:
         ws = sh.add_worksheet(title="interest", rows=1000, cols=3)
         ws.append_row(["doi", "user", "timestamp"])
-    try:
-        sh.worksheet("seen")
+    try: sh.worksheet("seen")
     except:
         ws = sh.add_worksheet(title="seen", rows=1000, cols=2)
         ws.append_row(["doi", "user"])
@@ -68,7 +64,6 @@ def batch_update_votes(user, selected_dois, all_displayed_dois):
     sh = get_db_connection()
     ws = sh.worksheet("interest")
     
-    # Refresh data to ensure we don't overwrite others
     data = ws.get_all_records()
     df = pd.DataFrame(data)
     
@@ -116,8 +111,7 @@ def get_shortlist_data(current_user):
     df_papers = pd.DataFrame(papers_data)
     if df_papers.empty: return pd.DataFrame()
     df_papers['doi'] = df_papers['doi'].astype(str)
-    
-    # CRITICAL FIX 1: Drop duplicate papers if they exist in DB
+    # Drop duplicate papers if they exist in DB
     df_papers = df_papers.drop_duplicates(subset=['doi'])
 
     df_interest = pd.DataFrame(interest_data)
@@ -148,8 +142,7 @@ def get_fresh_stream_by_date(current_user, start_date, end_date):
     df_p = pd.DataFrame(papers_data)
     if df_p.empty: return pd.DataFrame()
     df_p['doi'] = df_p['doi'].astype(str)
-    
-    # CRITICAL FIX 2: Drop duplicate papers here too
+    # Drop duplicate papers
     df_p = df_p.drop_duplicates(subset=['doi'])
     
     if interest_data:
@@ -164,9 +157,7 @@ def get_fresh_stream_by_date(current_user, start_date, end_date):
     else:
         my_seen_dois = set()
         
-    # Robust date conversion
     df_p['date_obj'] = pd.to_datetime(df_p['date']).dt.date
-    
     mask_date = (df_p['date_obj'] >= start_date) & (df_p['date_obj'] <= end_date)
     mask_not_voted = ~df_p['doi'].isin(voted_dois)
     mask_not_seen = ~df_p['doi'].isin(my_seen_dois)
@@ -185,7 +176,6 @@ def fetch_papers_range(start_date, end_date):
     sh = get_db_connection()
     ws = sh.worksheet("papers")
     
-    # We load current data to double-check duplicates
     existing_data = ws.get_all_records()
     if existing_data:
         seen_dois = set(pd.DataFrame(existing_data)['doi'].astype(str))
@@ -209,7 +199,6 @@ def fetch_papers_range(start_date, end_date):
             
             for p in papers:
                 if p.get('category').lower() == 'neuroscience':
-                    # Extra check before adding
                     if p['doi'] not in seen_dois:
                         seen_dois.add(p['doi'])
                         link = f"https://www.biorxiv.org/content/{p['doi']}v1"
@@ -236,11 +225,17 @@ def main():
     st.markdown("""
         <style>
                .block-container { padding-top: 2rem; padding-bottom: 5rem; }
+               
+               /* Badges: Small and colorful */
                .badge {
                    display: inline-block; padding: 2px 8px; margin-right: 4px; margin-top: 4px;
                    border-radius: 12px; color: white; font-size: 0.75rem; font-weight: 600; text-transform: uppercase;
                }
+               
+               /* Alignment Fixes */
                div[data-testid="stButton"] button { margin-top: 0px; }
+               
+               /* Simple Card Hover */
                div[data-testid="stVerticalBlockBorderWrapper"] {
                    border: 1px solid #e0e0e0; transition: all 0.2s ease-in-out;
                }
@@ -291,12 +286,17 @@ def main():
     for index, row in triaged_df.iterrows():
         all_visible_dois.append(row['doi'])
         with st.container(border=True):
-            c_check, c_meta, c_content = st.columns([0.03, 0.15, 0.82])
+            # FIXED RATIOS: [Check | Meta | Content]
+            # Meta is narrower (0.10) to keep things tight
+            c_check, c_meta, c_content = st.columns([0.03, 0.10, 0.87])
             with c_check:
                 if st.checkbox("", value=row['my_vote'], key=f"t_{row['doi']}_{user_name}"):
                     selected_dois.append(row['doi'])
             with c_meta:
-                st.markdown(f"### +{row['total_votes']}")
+                # CHANGED: Standard font size, bolded. Removed '###' header.
+                st.markdown(f"**+{row['total_votes']} Votes**")
+                
+                # Badges stay small
                 voters = str(row['voter_names']).split(',') if row['voter_names'] else []
                 html_badges = ""
                 for v in voters:
