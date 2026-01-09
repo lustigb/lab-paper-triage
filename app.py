@@ -7,6 +7,7 @@ import time
 
 # --- CONFIGURATION ---
 LAB_MEMBERS = ["Select User...", "Albert", "Shinsuke", "Jaeson", "Brian"]
+TOTAL_LAB_SIZE = len(LAB_MEMBERS) - 1 
 
 MEMBER_COLORS = {
     "Albert": "#3498db",   # Blue
@@ -130,7 +131,7 @@ def get_shortlist_data(current_user):
     shortlist = pd.merge(df_papers, stats, on='doi', how='inner')
     shortlist = shortlist.sort_values(by=['total_votes', 'date'], ascending=[False, False])
     
-    # Frozen Order Logic
+    # Frozen Order
     if 'shortlist_order' in st.session_state:
         frozen_order = st.session_state['shortlist_order']
         shortlist['doi_cat'] = pd.Categorical(shortlist['doi'], categories=frozen_order, ordered=True)
@@ -232,16 +233,11 @@ def main():
         <style>
                .block-container { padding-top: 2rem; padding-bottom: 5rem; }
                
-               /* Vote Badges */
+               /* Badges */
                .badge {
                    display: inline-block; padding: 2px 8px; margin-right: 4px; margin-top: 4px;
                    border-radius: 12px; color: white; font-size: 0.75rem; font-weight: 600; text-transform: uppercase;
                }
-               
-               /* Status Badges */
-               .status-saved { color: #3498db; font-weight: bold; font-size: 0.8rem; }
-               .status-new { color: #2ecc71; font-weight: bold; font-size: 0.8rem; }
-               .status-rem { color: #e74c3c; font-weight: bold; font-size: 0.8rem; }
 
                /* Card Styling */
                div[data-testid="stVerticalBlockBorderWrapper"] {
@@ -254,10 +250,7 @@ def main():
                    transform: translateX(2px); 
                }
                
-               /* Align Toggle */
-               div[data-testid="stToggle"] { margin-top: -10px; }
-               
-               /* Big Vote Count Number */
+               /* Vote Count Styling */
                .big-vote { font-size: 1.5rem; font-weight: 800; color: #333; line-height: 1.2; }
                .vote-share { font-size: 0.75rem; color: #666; }
         </style>
@@ -294,8 +287,6 @@ def main():
     selected_dois = []
 
     triaged_df = get_shortlist_data(user_name)
-    
-    # Calculate Total Votes in System for % Calculation
     total_system_votes = triaged_df['total_votes'].sum() if not triaged_df.empty else 1
 
     c_head, c_sort = st.columns([0.8, 0.2])
@@ -313,30 +304,57 @@ def main():
             # Layout: [VoteCount(0.12) | Toggle(0.12) | Content(0.76)]
             c_vote, c_toggle, c_content = st.columns([0.12, 0.12, 0.76])
             
-            # 1. Left: Vote Share Logic
             with c_vote:
                 st.markdown(f'<div class="big-vote">{row["total_votes"]}</div>', unsafe_allow_html=True)
-                
-                # Calculate Share %
                 share_pct = row['total_votes'] / total_system_votes
-                
-                # Show Text and Progress Bar
                 st.markdown(f'<div class="vote-share">{share_pct:.0%} share</div>', unsafe_allow_html=True)
                 st.progress(share_pct)
 
-            # 2. Middle: Toggle & State
             with c_toggle:
-                is_checked = st.toggle(f"👍 +1", value=row['my_vote'], key=f"t_{row['doi']}_{user_name}")
-                if is_checked:
+                # DYNAMIC LABEL LOGIC
+                # Determine the label based on State + Interaction
+                # Note: We need a temporary key to detect the interaction before we render? 
+                # Streamlit updates on interaction. 
+                
+                # Default Label
+                label = "👍 +1"
+                
+                # Check previous state from DB
+                was_voted = row['my_vote']
+                
+                # The widget will return True/False based on user click
+                # But we need to set the label *before* the click in the UI? 
+                # Actually, Streamlit reruns the script on click.
+                
+                # Logic:
+                # If DB=True, Widget=True -> Saved (Blue)
+                # If DB=True, Widget=False -> Removing (Red)
+                # If DB=False, Widget=True -> New (Green)
+                # If DB=False, Widget=False -> Default
+                
+                # We can't know the widget state *before* we render it for the first time in the loop.
+                # However, we can use session state to track *pending* changes if we wanted complex label updates.
+                # For simplicity, let's use the DB state to set the initial label style.
+                
+                # We will just use the DB state to determine the 'Resting' label.
+                # If the user toggles it, the label won't update instantly to 'New' unless we use session state callbacks.
+                # BUT, visual feedback via the toggle switch position is usually enough.
+                # Let's try to be clever:
+                
+                toggle_val = st.toggle(label, value=row['my_vote'], key=f"t_{row['doi']}_{user_name}")
+                
+                if toggle_val:
                     selected_dois.append(row['doi'])
                 
-                # Status Indicators
-                if row['my_vote'] and is_checked:
-                    st.markdown('<span class="status-saved">🔵 Saved</span>', unsafe_allow_html=True)
-                elif row['my_vote'] and not is_checked:
-                    st.markdown('<span class="status-rem">🔴 Removing</span>', unsafe_allow_html=True)
-                elif not row['my_vote'] and is_checked:
-                    st.markdown('<span class="status-new">🟢 New</span>', unsafe_allow_html=True)
+                # Implicit Status Indicators (Using Icons below toggle to keep it clean)
+                if was_voted and toggle_val:
+                    st.caption("🔵 Saved")
+                elif was_voted and not toggle_val:
+                    st.caption("🔴 Removing")
+                elif not was_voted and toggle_val:
+                    st.caption("🟢 New")
+                else:
+                    st.caption("") # Spacer
 
                 voters = str(row['voter_names']).split(',') if row['voter_names'] else []
                 if voters:
@@ -347,7 +365,6 @@ def main():
                             html_badges += f'<span class="badge" style="background-color:{color};">{v}</span>'
                         st.markdown(html_badges, unsafe_allow_html=True)
 
-            # 3. Right: Content
             with c_content:
                 with st.expander(f"**{row['title']}**"):
                     st.caption(f"{row['authors']} ({row['date']})")
@@ -369,12 +386,12 @@ def main():
             c_check, c_content, c_trash = st.columns([0.12, 0.83, 0.05])
             
             with c_check:
-                is_checked = st.toggle(f"👍 +1", value=row['my_vote'], key=f"f_{row['doi']}_{user_name}")
-                if is_checked:
+                toggle_val = st.toggle("👍 +1", value=row['my_vote'], key=f"f_{row['doi']}_{user_name}")
+                if toggle_val:
                     selected_dois.append(row['doi'])
-                
-                if is_checked:
-                    st.markdown('<span class="status-new">🟢 New</span>', unsafe_allow_html=True)
+                    st.caption("🟢 New")
+                else:
+                    st.caption("")
             
             with c_content:
                 with st.expander(f"{row['title']}"):
