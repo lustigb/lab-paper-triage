@@ -131,7 +131,6 @@ def get_shortlist_data(current_user):
     shortlist = pd.merge(df_papers, stats, on='doi', how='inner')
     shortlist = shortlist.sort_values(by=['total_votes', 'date'], ascending=[False, False])
     
-    # Frozen Order
     if 'shortlist_order' in st.session_state:
         frozen_order = st.session_state['shortlist_order']
         shortlist['doi_cat'] = pd.Categorical(shortlist['doi'], categories=frozen_order, ordered=True)
@@ -245,8 +244,8 @@ def main():
                    box-shadow: 0 4px 10px rgba(0,0,0,0.1);
                    transform: translateX(2px); 
                }
-               .big-vote { font-size: 1.5rem; font-weight: 800; color: #333; line-height: 1.2; }
-               .vote-share { font-size: 0.75rem; color: #666; }
+               /* New Style for Vote Share */
+               .share-text { font-size: 1.1rem; font-weight: 800; color: #444; line-height: 1.2; margin-bottom: 4px; }
                
                div[data-testid="stButton"] { text-align: center; }
         </style>
@@ -306,7 +305,7 @@ def main():
         
         # --- ICON-FIRST UI LABELS ---
         if db_voted and not user_clicked_toggle:
-            btn_label = "🗑️" # Saved State
+            btn_label = "🗑️" # Saved
         elif db_voted and user_clicked_toggle:
             btn_label = "❌ Remove" # Pending Removal
         elif not db_voted and user_clicked_toggle:
@@ -318,9 +317,9 @@ def main():
             c_vote, c_btn, c_content = st.columns([0.12, 0.12, 0.76])
             
             with c_vote:
-                st.markdown(f'<div class="big-vote">{row["total_votes"]}</div>', unsafe_allow_html=True)
+                # REPLACED BIG NUMBER WITH SHARE TEXT
                 share_pct = row['total_votes'] / total_system_votes
-                st.markdown(f'<div class="vote-share">{share_pct:.0%} share</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="share-text">{share_pct:.0%} Share</div>', unsafe_allow_html=True)
                 st.progress(share_pct)
 
             with c_btn:
