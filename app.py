@@ -248,7 +248,6 @@ def main():
                .big-vote { font-size: 1.5rem; font-weight: 800; color: #333; line-height: 1.2; }
                .vote-share { font-size: 0.75rem; color: #666; }
                
-               /* Center the button */
                div[data-testid="stButton"] { text-align: center; }
         </style>
         """, unsafe_allow_html=True)
@@ -286,13 +285,7 @@ def main():
     triaged_df = get_shortlist_data(user_name)
     total_system_votes = triaged_df['total_votes'].sum() if not triaged_df.empty else 1
 
-    c_head, c_sort = st.columns([0.8, 0.2])
-    c_head.markdown("### 🏆 Lab Shortlist (Active)")
-    if c_sort.button("🔄 Re-Sort List", help="Update order based on votes"):
-        if 'shortlist_order' in st.session_state:
-            del st.session_state['shortlist_order']
-        st.rerun()
-
+    st.markdown("### 🏆 Lab Shortlist (Active)")
     if triaged_df.empty: st.info("No papers shortlisted yet.")
     
     for index, row in triaged_df.iterrows():
@@ -302,32 +295,24 @@ def main():
         # --- STATE MACHINE ---
         db_voted = row['my_vote']
         
-        # Toggle Session State
         toggle_key = f"vote_state_{doi}_{user_name}"
         if toggle_key not in st.session_state:
             st.session_state[toggle_key] = False
         user_clicked_toggle = st.session_state[toggle_key]
         
-        # Calculate Final Selection
         is_effectively_selected = (db_voted != user_clicked_toggle)
         if is_effectively_selected:
             selected_dois.append(doi)
         
-        # --- BUTTON LABEL LOGIC (THE QUIET UI) ---
-        # ALL BUTTONS ARE 'secondary' (Neutral/Grey)
-        
+        # --- ICON-FIRST UI LABELS ---
         if db_voted and not user_clicked_toggle:
-            # SAVED STATE
-            btn_label = "🗑️ Remove"
+            btn_label = "🗑️" # Saved State -> Icon only
         elif db_voted and user_clicked_toggle:
-            # REMOVING STATE (Pending)
-            btn_label = "❌ Unvoted"
+            btn_label = "❌ Remove" # Pending Removal -> Text Warning
         elif not db_voted and user_clicked_toggle:
-            # NEW VOTE STATE (Pending)
-            btn_label = "✅ Voted"
+            btn_label = "✅ Voted" # Pending Vote -> Confirmation Text
         else:
-            # EMPTY STATE
-            btn_label = "👍 Vote"
+            btn_label = "👍" # Neutral State -> Icon only
 
         with st.container(border=True):
             c_vote, c_btn, c_content = st.columns([0.12, 0.12, 0.76])
@@ -339,7 +324,6 @@ def main():
                 st.progress(share_pct)
 
             with c_btn:
-                # Always Type="secondary" for neutral look
                 if st.button(btn_label, type="secondary", key=f"btn_{doi}_{user_name}"):
                     st.session_state[toggle_key] = not st.session_state[toggle_key]
                     st.rerun()
@@ -381,13 +365,12 @@ def main():
             selected_dois.append(doi)
             btn_label = "✅ Voted"
         else:
-            btn_label = "👍 Vote"
+            btn_label = "👍"
 
         with st.container(border=True):
             c_btn, c_content, c_trash = st.columns([0.12, 0.83, 0.05])
             
             with c_btn:
-                # Always Type="secondary"
                 if st.button(btn_label, type="secondary", key=f"f_btn_{doi}_{user_name}"):
                     st.session_state[toggle_key] = not st.session_state[toggle_key]
                     st.rerun()
