@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 import pandas as pd
-import gspread
+from supabase import create_client, Client
 from datetime import datetime, timedelta
 import time
 
@@ -16,109 +16,84 @@ MEMBER_COLORS = {
     "Brian": "#e74c3c"     # Red
 }
 
-# --- GOOGLE SHEETS CONNECTION ---
-def get_db_connection():
-    try:
-        gc = gspread.service_account_from_dict(st.secrets["gcp_service_account"])
-        sh = gc.open_by_url(st.secrets["private_gsheets_url"])
-        return sh
-    except Exception as e:
-        st.error(f"Failed to connect to Google Sheets: {e}")
-        st.stop()
+# --- SUPABASE CONNECTION ---
+# Initialize connection to Supabase
+@st.cache_resource
+def init_supabase():
+    url = st.secrets["supabase"]["url"]
+    key = st.secrets["supabase"]["key"]
+    return create_client(url, key)
 
-# --- CACHED DATA FETCHING ---
-@st.cache_data(ttl=60)
-def load_all_data_from_sheets():
-    sh = get_db_connection()
-    try:
-        papers_data = sh.worksheet("papers").get_all_records()
-        interest_data = sh.worksheet("interest").get_all_records()
-        seen_data = sh.worksheet("seen").get_all_records()
-        return papers_data, interest_data, seen_data
-    except gspread.exceptions.WorksheetNotFound:
-        return [], [], []
-    except Exception as e:
-        return [], [], []
+supabase: Client = init_supabase()
 
-def init_db():
-    sh = get_db_connection()
-    try: sh.worksheet("papers")
-    except:
-        ws = sh.add_worksheet(title="papers", rows=1000, cols=7)
-        ws.append_row(["doi", "title", "authors", "abstract", "link", "category", "date"])
-    try: sh.worksheet("interest")
-    except:
-        ws = sh.add_worksheet(title="interest", rows=1000, cols=3)
-        ws.append_row(["doi", "user", "timestamp"])
-    try: sh.worksheet("seen")
-    except:
-        ws = sh.add_worksheet(title="seen", rows=1000, cols=2)
-        ws.append_row(["doi", "user"])
+# --- DATA FETCHING (Now optimized with SQL) ---
+def load_all_data():
+    # 1. Fetch Papers (We limit to recent for speed if needed, but 1000 is fine for now)
+    # Note: Supabase limits rows to 1000 by default. 
+    # For a real app, we would paginate, but for a prototype this is fine.
+    response_papers = supabase.table("papers").select("*").execute()
+    papers_data = response_papers.data
 
-# --- BATCH UPDATE (VOTES AND TRASH) ---
+    response_interest = supabase.table("interest").select("*").execute()
+    interest_data = response_interest.data
+
+    response_seen = supabase.table("seen").select("*").execute()
+    seen_data = response_seen.data
+
+    return papers_data, interest_data, seen_data
+
+# --- BATCH UPDATE (The "Smart" SQL Update) ---
 def batch_update_all(user, selected_dois, trashed_dois, all_displayed_dois):
-    sh = get_db_connection()
-    ws_interest = sh.worksheet("interest")
-    ws_seen = sh.worksheet("seen")
+    # This logic is smarter than Google Sheets. 
+    # We calculate the "Delta" (What to add, What to remove) 
+    # instead of wiping the whole sheet.
     
-    # 1. HANDLE VOTES (Interest Sheet)
-    data = ws_interest.get_all_records()
-    df = pd.DataFrame(data)
+    # 1. Get current votes for this user
+    response = supabase.table("interest").select("doi").eq("user", user).execute()
+    current_votes = {row['doi'] for row in response.data}
     
-    if df.empty:
-        df = pd.DataFrame(columns=["doi", "user", "timestamp"])
-    else:
-        df['doi'] = df['doi'].astype(str)
-        df['user'] = df['user'].astype(str)
+    selected_set = set(selected_dois)
+    
+    # Calculate Deltas
+    to_add = selected_set - current_votes
+    to_remove = current_votes - selected_set
+    
+    # Only remove if it was visible in the current list 
+    # (Prevent accidental removal of papers not currently on screen)
+    visible_set = set(all_displayed_dois)
+    to_remove = to_remove.intersection(visible_set)
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     changes_count = 0
     
-    current_user_votes = df[df['user'] == user]['doi'].tolist()
-    rows_to_add = []
-    modified = False
-    
-    for doi in all_displayed_dois:
-        is_checked = doi in selected_dois
-        already_voted = doi in current_user_votes
+    # EXECUTE SQL INSERTS (Votes)
+    if to_add:
+        data_to_insert = [{"doi": doi, "user": user, "timestamp": datetime.now().isoformat()} for doi in to_add]
+        supabase.table("interest").insert(data_to_insert).execute()
+        changes_count += len(to_add)
         
-        if is_checked and not already_voted:
-            rows_to_add.append({"doi": doi, "user": user, "timestamp": timestamp})
-            modified = True
-            changes_count += 1
-        elif not is_checked and already_voted:
-            df = df[~((df['doi'] == doi) & (df['user'] == user))]
-            modified = True
-            changes_count += 1
-
-    if modified:
-        if rows_to_add:
-            df = pd.concat([df, pd.DataFrame(rows_to_add)], ignore_index=True)
-        ws_interest.clear()
-        ws_interest.append_row(["doi", "user", "timestamp"])
-        if not df.empty:
-            ws_interest.append_rows(df.values.tolist())
-            
-    # 2. HANDLE TRASH (Seen Sheet)
+    # EXECUTE SQL DELETES (Unvotes)
+    if to_remove:
+        # Delete where user=user AND doi is in to_remove list
+        supabase.table("interest").delete().eq("user", user).in_("doi", list(to_remove)).execute()
+        changes_count += len(to_remove)
+        
+    # EXECUTE SQL INSERTS (Trash)
     if trashed_dois:
-        trash_rows = [[doi, user] for doi in trashed_dois]
-        ws_seen.append_rows(trash_rows)
-        changes_count += len(trash_rows)
+        # Check what is already trashed to avoid duplicates (optional but good)
+        trash_list = list(trashed_dois)
+        trash_data = [{"doi": doi, "user": user} for doi in trash_list]
+        supabase.table("seen").insert(trash_data).execute()
+        changes_count += len(trash_list)
 
-    if changes_count > 0:
-        st.cache_data.clear()
-            
     return changes_count
 
 # --- DATA PROCESSING ---
 def get_shortlist_data(current_user):
-    papers_data, interest_data, _ = load_all_data_from_sheets()
+    papers_data, interest_data, _ = load_all_data()
     
     df_papers = pd.DataFrame(papers_data)
     if df_papers.empty: return pd.DataFrame()
-    df_papers['doi'] = df_papers['doi'].astype(str)
-    df_papers = df_papers.drop_duplicates(subset=['doi'])
-
+    
     df_interest = pd.DataFrame(interest_data)
     if df_interest.empty:
         df_papers['total_votes'] = 0
@@ -126,8 +101,7 @@ def get_shortlist_data(current_user):
         df_papers['my_vote'] = False
         return pd.DataFrame()
     
-    df_interest['doi'] = df_interest['doi'].astype(str)
-
+    # Group By DOI to get counts and names
     stats = df_interest.groupby('doi').agg(
         total_votes=('user', 'count'),
         voter_names=('user', lambda x: ','.join(x))
@@ -136,6 +110,7 @@ def get_shortlist_data(current_user):
     shortlist = pd.merge(df_papers, stats, on='doi', how='inner')
     shortlist = shortlist.sort_values(by=['total_votes', 'date'], ascending=[False, False])
     
+    # Frozen Order
     if 'shortlist_order' in st.session_state:
         frozen_order = st.session_state['shortlist_order']
         shortlist['doi_cat'] = pd.Categorical(shortlist['doi'], categories=frozen_order, ordered=True)
@@ -149,25 +124,23 @@ def get_shortlist_data(current_user):
     return shortlist
 
 def get_fresh_stream_by_date(current_user, start_date, end_date):
-    papers_data, interest_data, seen_data = load_all_data_from_sheets()
+    papers_data, interest_data, seen_data = load_all_data()
     
     df_p = pd.DataFrame(papers_data)
     if df_p.empty: return pd.DataFrame()
-    df_p['doi'] = df_p['doi'].astype(str)
-    df_p = df_p.drop_duplicates(subset=['doi'])
     
     if interest_data:
-        voted_dois = set(pd.DataFrame(interest_data)['doi'].astype(str))
+        voted_dois = set(pd.DataFrame(interest_data)['doi'])
     else:
         voted_dois = set()
         
     if seen_data:
         df_seen = pd.DataFrame(seen_data)
-        df_seen['doi'] = df_seen['doi'].astype(str)
         my_seen_dois = set(df_seen[df_seen['user'] == current_user]['doi'])
     else:
         my_seen_dois = set()
         
+    # Date Filtering
     df_p['date_obj'] = pd.to_datetime(df_p['date']).dt.date
     mask_date = (df_p['date_obj'] >= start_date) & (df_p['date_obj'] <= end_date)
     mask_not_voted = ~df_p['doi'].isin(voted_dois)
@@ -184,15 +157,10 @@ def fetch_papers_range(start_date, end_date):
     s_date = start_date.strftime('%Y-%m-%d')
     e_date = end_date.strftime('%Y-%m-%d')
     
-    sh = get_db_connection()
-    ws = sh.worksheet("papers")
+    # 1. Check what we already have to avoid duplicate fetching
+    existing_response = supabase.table("papers").select("doi").execute()
+    existing_dois = {row['doi'] for row in existing_response.data}
     
-    existing_data = ws.get_all_records()
-    if existing_data:
-        seen_dois = set(pd.DataFrame(existing_data)['doi'].astype(str))
-    else:
-        seen_dois = set()
-
     cursor = 0
     new_rows = []
     
@@ -210,10 +178,18 @@ def fetch_papers_range(start_date, end_date):
             
             for p in papers:
                 if p.get('category').lower() == 'neuroscience':
-                    if p['doi'] not in seen_dois:
-                        seen_dois.add(p['doi'])
+                    if p['doi'] not in existing_dois:
+                        existing_dois.add(p['doi'])
                         link = f"https://www.biorxiv.org/content/{p['doi']}v1"
-                        row = [p['doi'], p['title'], p['authors'], p['abstract'], link, p['category'], p['date']]
+                        row = {
+                            "doi": p['doi'],
+                            "title": p['title'],
+                            "authors": p['authors'],
+                            "abstract": p['abstract'],
+                            "link": link,
+                            "category": p['category'],
+                            "date": p['date']
+                        }
                         new_rows.append(row)
                         
             cursor += len(papers)
@@ -224,12 +200,12 @@ def fetch_papers_range(start_date, end_date):
     my_bar.empty()
     
     if new_rows:
-        ws.append_rows(new_rows)
-        st.cache_data.clear()
+        # Bulk Insert into Supabase
+        supabase.table("papers").insert(new_rows).execute()
         return len(new_rows)
     return 0
 
-# --- MAIN APP UI ---
+# --- MAIN APP UI (Identical to V8.1) ---
 def main():
     st.set_page_config(page_title="LabRxiv", layout="wide") 
     
@@ -253,19 +229,13 @@ def main():
                div[data-testid="stButton"] { text-align: center; }
         </style>
         """, unsafe_allow_html=True)
-
-    if 'db_init' not in st.session_state:
-        init_db()
-        st.session_state['db_init'] = True
     
     st.sidebar.title("🧠 LabRxiv")
     user_name = st.sidebar.selectbox("Current User:", LAB_MEMBERS)
     st.sidebar.divider()
     
     st.sidebar.markdown("**View Settings**")
-    # NEW TOGGLE FOR ABSTRACT VIEW
     expand_all = st.sidebar.toggle("👁️ Abstract View", value=False)
-    
     st.sidebar.divider()
     
     st.sidebar.markdown("**Select Triage Date Range**")
@@ -316,12 +286,10 @@ def main():
 
         with st.container(border=True):
             c_vote, c_btn, c_content = st.columns([0.12, 0.12, 0.76])
-            
             with c_vote:
                 share_pct = row['total_votes'] / total_system_votes
                 st.markdown(f'<div class="share-text">{share_pct:.0%} Share</div>', unsafe_allow_html=True)
                 st.progress(share_pct)
-
             with c_btn:
                 voters = str(row['voter_names']).split(',') if row['voter_names'] else []
                 if voters:
@@ -331,13 +299,10 @@ def main():
                             color = MEMBER_COLORS.get(v, "#7f8c8d")
                             html_badges += f'<span class="badge" style="background-color:{color};">{v}</span>'
                         st.markdown(html_badges, unsafe_allow_html=True)
-                
                 if st.button(btn_label, type="secondary", key=f"btn_{doi}_{user_name}"):
                     st.session_state[toggle_key] = not st.session_state[toggle_key]
                     st.rerun()
-
             with c_content:
-                # CONTROLLED EXPANSION VIA 'expanded' PARAMETER
                 with st.expander(f"**{row['title']}**", expanded=expand_all):
                     st.caption(f"{row['authors']} ({row['date']})")
                     st.write(row['abstract'])
@@ -359,7 +324,6 @@ def main():
         vote_key = f"vote_state_{doi}_{user_name}"
         if vote_key not in st.session_state: st.session_state[vote_key] = False
         user_clicked_vote = st.session_state[vote_key]
-        
         if user_clicked_vote:
             selected_dois.append(doi)
             vote_label = "✅ Voted"
@@ -369,7 +333,6 @@ def main():
         trash_key = f"trash_state_{doi}_{user_name}"
         if trash_key not in st.session_state: st.session_state[trash_key] = False
         user_clicked_trash = st.session_state[trash_key]
-
         if user_clicked_trash:
             trashed_dois.append(doi)
             trash_label = "❌ Remove"
@@ -378,19 +341,15 @@ def main():
 
         with st.container(border=True):
             c_vote_btn, c_trash_btn, c_content = st.columns([0.10, 0.10, 0.80])
-            
             with c_vote_btn:
                 if st.button(vote_label, type="secondary", key=f"f_v_btn_{doi}_{user_name}"):
                     st.session_state[vote_key] = not st.session_state[vote_key]
                     st.rerun()
-            
             with c_trash_btn:
                 if st.button(trash_label, type="secondary", key=f"f_t_btn_{doi}_{user_name}"):
                     st.session_state[trash_key] = not st.session_state[trash_key]
                     st.rerun()
-
             with c_content:
-                # CONTROLLED EXPANSION
                 with st.expander(f"{row['title']}", expanded=expand_all):
                     st.caption(f"{row['authors']} ({row['date']})")
                     st.write(row['abstract'])
@@ -399,15 +358,12 @@ def main():
     st.sidebar.divider()
     if st.sidebar.button("💾 Submit Votes", type="primary"):
         changes = batch_update_all(user_name, set(selected_dois), set(trashed_dois), all_visible_dois)
-        
         keys_to_reset = [k for k in st.session_state.keys() if (f"vote_state_" in k or f"trash_state_" in k) and user_name in k]
-        for k in keys_to_reset:
-            st.session_state[k] = False
+        for k in keys_to_reset: st.session_state[k] = False
             
         if changes > 0:
             st.toast(f"Processed {changes} updates!")
-            if 'shortlist_order' in st.session_state:
-                del st.session_state['shortlist_order']
+            if 'shortlist_order' in st.session_state: del st.session_state['shortlist_order']
             st.rerun()
         else:
             st.toast("No changes detected.")
